@@ -1,7 +1,7 @@
 use byteorder::{BigEndian, ByteOrder};
-use mio::{net::TcpListener, net::TcpStream, Events, Interest, Token};
+use futures_util::stream::StreamExt;
+use mio::{net::TcpListener, net::TcpStream};
 use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
-use socket2::{Domain, Socket, Type};
 use solicit::http::connection::HttpFrame;
 use solicit::http::frame::{
     unpack_header, DataFrame, Frame, FrameIR, HeadersFlag, HeadersFrame, HttpSetting, PingFrame,
@@ -9,27 +9,18 @@ use solicit::http::frame::{
 };
 use solicit::http::{Header, INITIAL_CONNECTION_WINDOW_SIZE};
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::io::{Cursor, Read, Write};
-use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::io::Cursor;
 use std::time::SystemTime;
-use std::{env, io, thread};
 use thiserror::Error;
 
 mod helloworld;
+mod runtime;
 
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
 extern crate slice_as_array;
-
-thread_local! {
-    static POLL : RefCell<mio::Poll> = {
-        RefCell::new(mio::Poll::new().unwrap())
-    };
-}
 
 lazy_static! {
     static ref HTTP_STATUS_HEADERS: Vec<u8> = {
@@ -62,13 +53,13 @@ pub enum Error {
     #[error("wrong headers")]
     WrongHeaders,
     #[error("disconnected")]
-    Disconnected(#[from] io::Error),
+    Disconnected(#[from] std::io::Error),
     #[error("wrong http frame")]
     WrongHttpFrame(solicit::http::HttpError),
 }
 
 struct Client {
-    stream: TcpStream,
+    stream: runtime::Async<TcpStream>,
     buffer: bytes::BytesMut,
     established: bool,
     wqueue: VecDeque<Vec<u8>>,
@@ -77,36 +68,8 @@ struct Client {
     decoder: hpack::Decoder<'static>,
 }
 
-impl Drop for Client {
-    fn drop(&mut self) {
-        POLL.with(|poll| {
-            poll.borrow_mut()
-                .registry()
-                .deregister(&mut self.stream)
-                .unwrap();
-        });
-    }
-}
-
 impl Client {
-    fn new(mut stream: TcpStream) -> Self {
-        stream.set_nodelay(true).unwrap();
-        let raw_fd = stream.as_raw_fd();
-        let token = Token(raw_fd as usize);
-
-        let flags =
-            nix::fcntl::OFlag::from_bits(nix::fcntl::fcntl(raw_fd, nix::fcntl::F_GETFL).unwrap())
-                .unwrap()
-                | nix::fcntl::OFlag::O_NONBLOCK;
-        nix::fcntl::fcntl(raw_fd, nix::fcntl::F_SETFL(flags)).unwrap();
-
-        POLL.with(|poll| {
-            poll.borrow_mut()
-                .registry()
-                .register(&mut stream, token, Interest::READABLE | Interest::WRITABLE)
-                .unwrap();
-        });
-
+    fn new(stream: runtime::Async<TcpStream>) -> Self {
         let mut c = Client {
             stream,
             buffer: bytes::BytesMut::new(),
@@ -125,28 +88,24 @@ impl Client {
         c
     }
 
-    fn token(&self) -> Token {
-        Token(self.stream.as_raw_fd() as usize)
-    }
-
     fn queue<T: FrameIR>(&mut self, frame: T) {
         let mut buf = Cursor::new(Vec::new());
         frame.serialize_into(&mut buf).unwrap();
         self.wqueue.push_back(buf.into_inner());
     }
 
-    fn flush(&mut self) {
+    async fn flush(&mut self) {
         while let Some(buf) = self.wqueue.pop_front() {
             if buf.len() > self.window_size as usize {
                 println!("window size is full!");
                 self.wqueue.push_front(buf);
                 return;
             }
-            match self.stream.write(&buf) {
+
+            match self.stream.write(&buf).await {
                 Ok(_) => {}
                 Err(_) => {
                     self.wqueue.push_front(buf);
-                    return;
                 }
             }
         }
@@ -157,40 +116,6 @@ impl Client {
             return None;
         }
         Some(self.buffer.split_to(size).to_vec())
-    }
-
-    fn read_all(&mut self) -> Result<(), Error> {
-        const RESERVE: usize = 8192;
-        loop {
-            let len = self.buffer.len();
-            self.buffer.reserve(len + RESERVE);
-            unsafe {
-                self.buffer.set_len(len + RESERVE);
-            }
-            match self.stream.read(&mut self.buffer.as_mut()[len..]) {
-                Ok(n) => {
-                    unsafe {
-                        self.buffer.set_len(len + n);
-                    }
-                    if n == 0 {
-                        return Err(Error::Disconnected(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionReset,
-                            "read returned zero",
-                        )));
-                    }
-                }
-                Err(e) => {
-                    unsafe {
-                        self.buffer.set_len(len);
-                    }
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        break;
-                    }
-                    return Err(Error::Disconnected(e));
-                }
-            }
-        }
-        return Ok(());
     }
 
     fn handle_dataframe(&mut self, frame: DataFrame) -> Result<(), Error> {
@@ -236,83 +161,106 @@ impl Client {
         Ok(())
     }
 
-    fn handle(&mut self, readable: bool, _writable: bool) -> Result<(), Error> {
-        if readable {
-            self.read_all()?;
+    async fn handle(&mut self) -> Result<(), Error> {
+        const RESERVE: usize = 8192;
 
-            if !self.established {
-                match self.consume(PREFACE.len()) {
-                    Some(buf) => {
-                        if &buf != &PREFACE as &'static Vec<u8> {
-                            return Err(Error::WrongPreface);
-                        }
-                        self.established = true;
-                    }
-                    None => {
-                        return Ok(());
-                    }
+        let len = self.buffer.len();
+        self.buffer.reserve(len + RESERVE);
+        unsafe {
+            self.buffer.set_len(len + RESERVE);
+        }
+        match self.stream.read(&mut self.buffer.as_mut()[len..]).await {
+            Ok(n) => {
+                unsafe {
+                    self.buffer.set_len(len + n);
+                }
+                if n == 0 {
+                    return Err(Error::Disconnected(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "read returned zero",
+                    )));
                 }
             }
+            Err(e) => {
+                unsafe {
+                    self.buffer.set_len(len);
+                }
+                return Err(Error::Disconnected(e));
+            }
+        }
 
-            if self.established {
-                loop {
-                    if self.buffer.len() < FRAME_HEADER_LEN {
-                        break;
+        if !self.established {
+            match self.consume(PREFACE.len()) {
+                Some(buf) => {
+                    if &buf != &PREFACE as &'static Vec<u8> {
+                        return Err(Error::WrongPreface);
                     }
-                    let header = unpack_header(
-                        slice_as_array!(
-                            &self.buffer.as_ref()[0..FRAME_HEADER_LEN],
-                            [u8; FRAME_HEADER_LEN]
-                        )
-                        .unwrap(),
-                    );
-
-                    match self.consume(FRAME_HEADER_LEN + header.0 as usize) {
-                        Some(buf) => {
-                            let raw = RawFrame::from(buf);
-                            match HttpFrame::from_raw(&raw) {
-                                Ok(frame) => match frame {
-                                    HttpFrame::DataFrame(frame) => {
-                                        self.handle_dataframe(frame)?;
-                                    }
-                                    HttpFrame::HeadersFrame(frame) => {
-                                        for (k, v) in
-                                            self.decoder.decode(&frame.header_fragment()).unwrap()
-                                        {
-                                            if let Some(expected) = REQUEST_HEADERS.get(&k) {
-                                                if &v != expected {
-                                                    // should send an error response instead
-                                                    return Err(Error::WrongHeaders);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    HttpFrame::RstStreamFrame(_) => {}
-                                    HttpFrame::SettingsFrame(frame) => {
-                                        if !frame.is_ack() {
-                                            self.queue(SettingsFrame::new_ack());
-                                        }
-                                    }
-                                    HttpFrame::PingFrame(frame) => {
-                                        if !frame.is_ack() {
-                                            self.queue(PingFrame::new_ack(frame.opaque_data()));
-                                        }
-                                    }
-                                    HttpFrame::GoawayFrame(_) => {}
-                                    HttpFrame::WindowUpdateFrame(frame) => {
-                                        self.window_size += frame.increment() as i32;
-                                    }
-                                    HttpFrame::UnknownFrame(_) => {}
-                                },
-                                Err(e) => return Err(Error::WrongHttpFrame(e)),
-                            }
-                        }
-                        None => break,
-                    }
+                    self.established = true;
+                }
+                None => {
+                    return Ok(());
                 }
             }
         }
-        self.flush();
+
+        if self.established {
+            loop {
+                if self.buffer.len() < FRAME_HEADER_LEN {
+                    break;
+                }
+                let header = unpack_header(
+                    slice_as_array!(
+                        &self.buffer.as_ref()[0..FRAME_HEADER_LEN],
+                        [u8; FRAME_HEADER_LEN]
+                    )
+                    .unwrap(),
+                );
+
+                match self.consume(FRAME_HEADER_LEN + header.0 as usize) {
+                    Some(buf) => {
+                        let raw = RawFrame::from(buf);
+                        match HttpFrame::from_raw(&raw) {
+                            Ok(frame) => match frame {
+                                HttpFrame::DataFrame(frame) => {
+                                    self.handle_dataframe(frame)?;
+                                }
+                                HttpFrame::HeadersFrame(frame) => {
+                                    for (k, v) in
+                                        self.decoder.decode(&frame.header_fragment()).unwrap()
+                                    {
+                                        if let Some(expected) = REQUEST_HEADERS.get(&k) {
+                                            if &v != expected {
+                                                // should send an error response instead
+                                                return Err(Error::WrongHeaders);
+                                            }
+                                        }
+                                    }
+                                }
+                                HttpFrame::RstStreamFrame(_) => {}
+                                HttpFrame::SettingsFrame(frame) => {
+                                    if !frame.is_ack() {
+                                        self.queue(SettingsFrame::new_ack());
+                                    }
+                                }
+                                HttpFrame::PingFrame(frame) => {
+                                    if !frame.is_ack() {
+                                        self.queue(PingFrame::new_ack(frame.opaque_data()));
+                                    }
+                                }
+                                HttpFrame::GoawayFrame(_) => {}
+                                HttpFrame::WindowUpdateFrame(frame) => {
+                                    self.window_size += frame.increment() as i32;
+                                }
+                                HttpFrame::UnknownFrame(_) => {}
+                            },
+                            Err(e) => return Err(Error::WrongHttpFrame(e)),
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.flush().await;
         Ok(())
     }
 
@@ -323,78 +271,19 @@ impl Client {
     }
 }
 
-struct Greeter {
-    listener: TcpListener,
+async fn handle_client(mut client: Client) {
+    while client.handle().await.is_ok() {}
 }
 
-impl Greeter {
-    fn new(addr: SocketAddr) -> Self {
-        let sock = Socket::new(Domain::ipv6(), Type::stream(), None).unwrap();
-        sock.set_reuse_address(true).unwrap();
-        sock.set_reuse_port(true).unwrap();
-        sock.set_nonblocking(true).unwrap();
-        sock.bind(&addr.into()).unwrap();
-        sock.listen(1024).unwrap();
-
-        let mut listener = TcpListener::from_std(sock.into_tcp_listener());
-        let listen_token = Token(listener.as_raw_fd() as usize);
-        POLL.with(|poll| {
-            poll.borrow_mut()
-                .registry()
-                .register(&mut listener, listen_token, Interest::READABLE)
-                .unwrap();
-        });
-        Greeter { listener }
-    }
-
-    fn serve(&self) {
-        let mut events = Events::with_capacity(1024);
-        let mut clients = HashMap::new();
-        let token = Token(self.listener.as_raw_fd() as usize);
-
-        loop {
-            POLL.with(|poll| {
-                poll.borrow_mut().poll(&mut events, None).unwrap();
-            });
-
-            for e in events.into_iter() {
-                if e.token() == token {
-                    while let Ok((stream, _)) = self.listener.accept() {
-                        let client = Client::new(stream);
-                        clients.insert(client.token(), client);
-                    }
-                } else if let Some(client) = clients.get_mut(&e.token()) {
-                    let r = client.handle(e.is_readable(), e.is_writable());
-                    if r.is_err() || e.is_error() || e.is_read_closed() || e.is_write_closed() {
-                        clients.remove(&e.token());
-                    }
-                }
-            }
+async fn serve() {
+    let mut listener = runtime::Async::<TcpListener>::new("[::]:50051".parse().unwrap());
+    while let Some(ret) = listener.next().await {
+        if let Ok(stream) = ret {
+            runtime::spawn(handle_client(Client::new(stream)));
         }
     }
 }
 
 fn main() {
-    let addr = "[::]:50051".parse().unwrap();
-    let cpus = {
-        env::var("RUSTMAXPROCS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(num_cpus::get)
-    };
-
-    println!("Hello, greeter ({} cpus)!", cpus);
-
-    let mut handles = Vec::new();
-    for i in 0..cpus {
-        let h = thread::spawn(move || {
-            core_affinity::set_for_current(core_affinity::CoreId { id: i });
-
-            Greeter::new(addr).serve();
-        });
-        handles.push(h);
-    }
-    for h in handles {
-        let _ = h.join();
-    }
+    runtime::run(serve);
 }
