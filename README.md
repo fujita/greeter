@@ -8,6 +8,7 @@
 - grpc-go (1c32b026)
 - tonic (c7fd9d45)
 [with modification for accepting any IP addresses and returning the same response as grpc-go](https://github.com/fujita/tonic/tree/benchmark)
+- this software (5ff94430)
 - ghz 0.59.0
 
 ## Hardware
