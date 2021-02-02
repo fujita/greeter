@@ -1,6 +1,4 @@
 use byteorder::{BigEndian, ByteOrder};
-use futures_util::stream::StreamExt;
-use mio::{net::TcpListener, net::TcpStream};
 use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
 use solicit::http::connection::HttpFrame;
 use solicit::http::frame::{
@@ -13,14 +11,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::time::SystemTime;
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-mod helloworld;
-mod runtime;
-
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate slice_as_array;
+use crate::helloworld;
 
 lazy_static! {
     static ref HTTP_STATUS_HEADERS: Vec<u8> = {
@@ -58,8 +51,8 @@ pub enum Error {
     WrongHttpFrame(solicit::http::HttpError),
 }
 
-struct Client {
-    stream: runtime::Async<TcpStream>,
+pub struct Client<I> {
+    stream: I,
     buffer: bytes::BytesMut,
     established: bool,
     wqueue: VecDeque<Vec<u8>>,
@@ -68,8 +61,11 @@ struct Client {
     decoder: hpack::Decoder<'static>,
 }
 
-impl Client {
-    fn new(stream: runtime::Async<TcpStream>) -> Self {
+impl<I> Client<I>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    pub fn new(stream: I) -> Self {
         let mut c = Client {
             stream,
             buffer: bytes::BytesMut::new(),
@@ -264,26 +260,13 @@ impl Client {
         Ok(())
     }
 
+    pub async fn serve(&mut self) {
+        while self.handle().await.is_ok() {}
+    }
+
     fn say_hello(&self, req: helloworld::HelloRequest) -> helloworld::HelloReply {
         helloworld::HelloReply {
             message: Cow::Owned(format!("Hello {}", req.name)),
         }
     }
-}
-
-async fn handle_client(mut client: Client) {
-    while client.handle().await.is_ok() {}
-}
-
-async fn serve() {
-    let mut listener = runtime::Async::<TcpListener>::new("[::]:50051".parse().unwrap());
-    while let Some(ret) = listener.next().await {
-        if let Ok(stream) = ret {
-            runtime::spawn(handle_client(Client::new(stream)));
-        }
-    }
-}
-
-fn main() {
-    runtime::run(serve);
 }
