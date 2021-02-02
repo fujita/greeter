@@ -53,16 +53,22 @@ where
 
             let mut events = Events::with_capacity(1024);
             loop {
-                let mut ready = VecDeque::new();
-                RUNNABLE.with(|runnable| {
-                    ready.append(&mut runnable.borrow_mut());
-                });
+                loop {
+                    let mut ready = VecDeque::new();
+                    RUNNABLE.with(|runnable| {
+                        ready.append(&mut runnable.borrow_mut());
+                    });
 
-                while let Some(t) = ready.pop_front() {
-                    let future = t.future.borrow_mut();
-                    let w = waker(t.clone());
-                    let mut context = Context::from_waker(&w);
-                    if let Poll::Pending = Pin::new(future).as_mut().poll(&mut context) {}
+                    if ready.len() == 0 {
+                        break;
+                    }
+
+                    while let Some(t) = ready.pop_front() {
+                        let future = t.future.borrow_mut();
+                        let w = waker(t.clone());
+                        let mut context = Context::from_waker(&w);
+                        let _ = Pin::new(future).as_mut().poll(&mut context);
+                    }
                 }
 
                 POLLER.with(|poller| {
@@ -98,10 +104,7 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
     let t = Rc::new(Task {
         future: RefCell::new(future.boxed()),
     });
-    let mut future = t.future.borrow_mut();
-    let w = waker(t.clone());
-    let mut context = Context::from_waker(&w);
-    if let Poll::Pending = future.as_mut().poll(&mut context) {}
+    RUNNABLE.with(|runnable| runnable.borrow_mut().push_back(t));
 }
 
 pub struct Async<T: Source> {
