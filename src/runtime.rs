@@ -2,7 +2,7 @@ use futures::future::{BoxFuture, FutureExt};
 use futures::prelude::*;
 use mio::{event::Source, net::TcpListener, net::TcpStream, Events, Interest, Token};
 use socket2::{Domain, Socket, Type};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -27,7 +27,6 @@ thread_local! {
     static RUNNABLE : RefCell<VecDeque<Rc<Task>>> = {
         RefCell::new(VecDeque::new())
     };
-
 }
 
 pub fn run<F, T>(f: F)
@@ -53,16 +52,35 @@ where
 
             let mut events = Events::with_capacity(1024);
             loop {
-                let mut ready = VecDeque::new();
-                RUNNABLE.with(|runnable| {
-                    ready.append(&mut runnable.borrow_mut());
-                });
+                loop {
+                    let mut ready = VecDeque::new();
 
-                while let Some(t) = ready.pop_front() {
-                    let future = t.future.borrow_mut();
-                    let w = waker(t.clone());
-                    let mut context = Context::from_waker(&w);
-                    if let Poll::Pending = Pin::new(future).as_mut().poll(&mut context) {}
+                    RUNNABLE.with(|runnable| {
+                        ready.append(&mut runnable.borrow_mut());
+                    });
+
+                    if ready.len() == 0 {
+                        break;
+                    }
+
+                    while let Some(t) = ready.pop_front() {
+                        t.state.swap(&Cell::new(State::Running));
+
+                        let r = {
+                            let w = waker(t.clone());
+                            let mut context = Context::from_waker(&w);
+                            let future = t.future.borrow_mut();
+                            Pin::new(future).as_mut().poll(&mut context)
+                        };
+                        if r == Poll::Pending {
+                            match t.state.get() {
+                                State::Running => t.state.swap(&Cell::new(State::Pending)),
+                                _ => {}
+                            }
+                        } else {
+                            t.state.swap(&Cell::new(State::Done));
+                        }
+                    }
                 }
 
                 POLLER.with(|poller| {
@@ -84,24 +102,41 @@ where
     }
 }
 
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum State {
+    Ready,   // on runnable
+    Running, // during polling
+    Pending, // wait for event
+    Done,
+}
+
 struct Task {
+    state: std::cell::Cell<State>,
     future: RefCell<BoxFuture<'static, ()>>,
 }
 
 impl RcWake for Task {
     fn wake_by_ref(arc_self: &Rc<Self>) {
-        RUNNABLE.with(|runnable| runnable.borrow_mut().push_back(arc_self.clone()));
+        match arc_self.state.get() {
+            State::Ready => { /* do nothing */ }
+            State::Pending => {
+                arc_self.state.swap(&Cell::new(State::Ready));
+                RUNNABLE.with(|runnable| runnable.borrow_mut().push_back(arc_self.clone()))
+            }
+            State::Running => {
+                arc_self.state.swap(&Cell::new(State::Ready));
+            }
+            State::Done => {}
+        }
     }
 }
 
 pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
     let t = Rc::new(Task {
+        state: Cell::new(State::Ready),
         future: RefCell::new(future.boxed()),
     });
-    let mut future = t.future.borrow_mut();
-    let w = waker(t.clone());
-    let mut context = Context::from_waker(&w);
-    if let Poll::Pending = future.as_mut().poll(&mut context) {}
+    RUNNABLE.with(|runnable| runnable.borrow_mut().push_back(t));
 }
 
 pub struct Async<T: Source> {
@@ -156,6 +191,18 @@ impl Stream for Async<TcpListener> {
             }
             Err(e) => std::task::Poll::Ready(Some(Err(e))),
         }
+    }
+}
+
+impl hyper::server::accept::Accept for Async<TcpListener> {
+    type Conn = Async<TcpStream>;
+    type Error = std::io::Error;
+
+    fn poll_accept(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+        self.poll_next(cx)
     }
 }
 
@@ -216,13 +263,63 @@ impl Async<TcpStream> {
         });
         Async { io: Box::new(io) }
     }
+}
 
-    pub fn read<'a>(&'a mut self, b: &'a mut [u8]) -> ReadFuture {
-        ReadFuture(self, b)
+impl tokio::io::AsyncRead for Async<TcpStream> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        let token = Token(self.io.as_raw_fd() as usize);
+        unsafe {
+            let b = &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
+            match self.io.read(b) {
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    POLLER
+                        .with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
+                    Poll::Pending
+                }
+                Ok(n) => {
+                    buf.assume_init(n);
+                    buf.advance(n);
+                    Poll::Ready(Ok(()))
+                }
+                Err(e) => Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Async<TcpStream> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
+        let token = Token(self.io.as_raw_fd() as usize);
+        match self.io.write(buf) {
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                POLLER.with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
+                Poll::Pending
+            }
+            x => Poll::Ready(x),
+        }
     }
 
-    pub fn write<'a>(&'a mut self, b: &'a [u8]) -> WriteFuture {
-        WriteFuture(self, b)
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        self.io.shutdown(std::net::Shutdown::Write)?;
+        Poll::Ready(Ok(()))
     }
 }
 
