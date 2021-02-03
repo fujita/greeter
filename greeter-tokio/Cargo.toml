@@ -7,9 +7,9 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-socket2 = {version="0.3", features = ["reuseport"]}
+proto = { path="../proto" }
+socket2 = { version="0.3", features = ["reuseport"] }
 nix = "0.18"
 futures = "0.3"
 futures-util = "0.3"
-proto = {path="../proto"}
 tokio = { version = "1", features = ["full"] }

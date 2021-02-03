@@ -2,7 +2,8 @@
 
 members = [
     "proto",
+    "greeter-async-std",
     "greeter-minimum",
-    "greeter-tokio",
     "greeter-smol",
+    "greeter-tokio",
 ]

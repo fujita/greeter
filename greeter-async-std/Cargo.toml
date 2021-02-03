@@ -1,5 +1,5 @@
 [package]
-name = "greeter-smol"
+name = "greeter-async-std"
 version = "0.1.0"
 authors = ["FUJITA Tomonori <fujita.tomonori@gmail.com>"]
 edition = "2018"
@@ -8,11 +8,7 @@ edition = "2018"
 
 [dependencies]
 proto = { path="../proto" }
-socket2 = { version="0.3", features = ["reuseport"] }
+async-std = "1.9"
+socket2 = {version="0.3", features = ["reuseport"]}
 nix = "0.18"
-futures = "0.3"
-futures-util = "0.3"
-tokio = { version = "1", features = ["full"] }
-smol = "1.2"
 async-compat = "0.2"
-num_cpus = "1.0"
