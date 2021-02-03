@@ -8,7 +8,7 @@ edition = "2018"
 
 [dependencies]
 mio = {version="0.7", features = ["os-poll","tcp"]}
-socket2 = {version="0.3", features = ["reuseport"]}
+socket2 = {version="0.3.18", features = ["reuseport"]}
 solicit = { git = "https://github.com/mlalic/solicit", rev = "fdccb36" }
 slice_as_array = "1.0"
 hpack = "0.3"
