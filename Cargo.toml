@@ -4,4 +4,5 @@ members = [
     "proto",
     "greeter-minimum",
     "greeter-tokio",
+    "greeter-smol",
 ]
