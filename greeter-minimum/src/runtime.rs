@@ -1,11 +1,9 @@
 use futures::future::{BoxFuture, FutureExt};
 use futures::prelude::*;
 use mio::{event::Source, net::TcpListener, net::TcpStream, Events, Interest, Token};
-use socket2::{Domain, Socket, Type};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -121,19 +119,8 @@ impl<T: Source> Drop for Async<T> {
 }
 
 impl Async<TcpListener> {
-    pub fn new(addr: SocketAddr) -> Self {
-        let domain = match addr {
-            SocketAddr::V4(_) => Domain::ipv4(),
-            SocketAddr::V6(_) => Domain::ipv6(),
-        };
-        let sock = Socket::new(domain, Type::stream(), None).unwrap();
-        sock.set_reuse_address(true).unwrap();
-        sock.set_reuse_port(true).unwrap();
-        sock.set_nonblocking(true).unwrap();
-        sock.bind(&addr.into()).unwrap();
-        sock.listen(8192).unwrap();
-
-        let mut listener = TcpListener::from_std(sock.into_tcp_listener());
+    pub fn new(listener: std::net::TcpListener) -> Self {
+        let mut listener = TcpListener::from_std(listener);
         let token = Token(listener.as_raw_fd() as usize);
 
         POLLER.with(|poller| {

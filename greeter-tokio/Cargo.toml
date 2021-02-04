@@ -8,8 +8,6 @@ edition = "2018"
 
 [dependencies]
 proto = { path="../proto" }
-socket2 = { version="0.3", features = ["reuseport"] }
-nix = "0.18"
 futures = "0.3"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }

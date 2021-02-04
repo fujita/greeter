@@ -9,7 +9,6 @@ edition = "2018"
 [dependencies]
 proto = { path="../proto" }
 mio = { version="0.7", features = ["os-poll","tcp"] }
-socket2 = { version="0.3", features = ["reuseport"] }
 num_cpus = "1.0"
 core_affinity = "0.5"
 nix = "0.18"

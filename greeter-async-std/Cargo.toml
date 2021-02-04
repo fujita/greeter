@@ -9,6 +9,4 @@ edition = "2018"
 [dependencies]
 proto = { path="../proto" }
 async-std = "1.9"
-socket2 = {version="0.3", features = ["reuseport"]}
-nix = "0.18"
 async-compat = "0.2"
