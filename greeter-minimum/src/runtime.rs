@@ -122,7 +122,11 @@ impl<T: Source> Drop for Async<T> {
 
 impl Async<TcpListener> {
     pub fn new(addr: SocketAddr) -> Self {
-        let sock = Socket::new(Domain::ipv6(), Type::stream(), None).unwrap();
+        let domain = match addr {
+            SocketAddr::V4(_) => Domain::ipv4(),
+            SocketAddr::V6(_) => Domain::ipv6(),
+        };
+        let sock = Socket::new(domain, Type::stream(), None).unwrap();
         sock.set_reuse_address(true).unwrap();
         sock.set_reuse_port(true).unwrap();
         sock.set_nonblocking(true).unwrap();
