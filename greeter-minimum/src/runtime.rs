@@ -57,7 +57,7 @@ where
                         ready.append(&mut runnable.borrow_mut());
                     });
 
-                    if ready.len() == 0 {
+                    if ready.is_empty() {
                         break;
                     }
 

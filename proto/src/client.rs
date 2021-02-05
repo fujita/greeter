@@ -157,6 +157,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::transmute_ptr_to_ref)]
     async fn handle(&mut self) -> Result<(), Error> {
         const RESERVE: usize = 8192;
 

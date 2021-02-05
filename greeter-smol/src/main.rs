@@ -2,12 +2,10 @@ use smol::Async;
 
 fn main() {
     // smol uses one cpu by default. explicitly needs to specify
-    std::env::var("SMOL_THREADS").err().and_then(|_| {
-        Some(std::env::set_var(
-            "SMOL_THREADS",
-            num_cpus::get().to_string(),
-        ))
-    });
+    if std::env::var("SMOL_THREADS").is_err() {
+        std::env::set_var("SMOL_THREADS", num_cpus::get().to_string())
+    }
+
     println!("Hello, greeter-smol!");
 
     smol::block_on(async {
