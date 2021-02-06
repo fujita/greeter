@@ -1,8 +1,9 @@
 use futures::future::{BoxFuture, FutureExt};
 use futures::prelude::*;
 use mio::{event::Source, net::TcpListener, net::TcpStream, Events, Interest, Token};
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
@@ -11,21 +12,30 @@ use std::{env, thread};
 
 struct Poller {
     poll: mio::Poll,
-    wait: HashMap<Token, Waker>,
+    wait: FxHashMap<Token, Waker>,
 }
+
+const NR_TASKS: usize = 2048;
 
 thread_local! {
     static POLLER : RefCell<Poller> = {
         RefCell::new(Poller{
             poll: mio::Poll::new().unwrap(),
-            wait: HashMap::new(),
+            wait: FxHashMap::default(),
         })
     };
 
     static RUNNABLE : RefCell<VecDeque<Rc<Task>>> = {
-        RefCell::new(VecDeque::new())
+        RefCell::new(VecDeque::with_capacity(NR_TASKS))
     };
 
+}
+
+fn run_task(t: Rc<Task>) {
+    let future = t.future.borrow_mut();
+    let w = waker(t.clone());
+    let mut context = Context::from_waker(&w);
+    let _ = Pin::new(future).as_mut().poll(&mut context);
 }
 
 pub fn run<F, T>(f: F)
@@ -49,30 +59,19 @@ where
             core_affinity::set_for_current(core_affinity::CoreId { id: i });
             spawn(r);
 
-            let mut events = Events::with_capacity(1024);
+            let mut events = Events::with_capacity(NR_TASKS);
             loop {
-                loop {
-                    let mut ready = VecDeque::new();
-                    RUNNABLE.with(|runnable| {
-                        ready.append(&mut runnable.borrow_mut());
-                    });
+                let mut ready =
+                    RUNNABLE.with(|runnable| runnable.replace(VecDeque::with_capacity(NR_TASKS)));
 
-                    if ready.is_empty() {
-                        break;
-                    }
-
-                    while let Some(t) = ready.pop_front() {
-                        let future = t.future.borrow_mut();
-                        let w = waker(t.clone());
-                        let mut context = Context::from_waker(&w);
-                        let _ = Pin::new(future).as_mut().poll(&mut context);
-                    }
+                for t in ready.drain(..) {
+                    run_task(t);
                 }
 
                 POLLER.with(|poller| {
                     let mut p = poller.borrow_mut();
                     p.poll.poll(&mut events, None).unwrap();
-                    for e in events.into_iter() {
+                    for e in events.iter() {
                         if let Some(w) = p.wait.remove(&e.token()) {
                             w.wake();
                         }
@@ -102,7 +101,7 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
     let t = Rc::new(Task {
         future: RefCell::new(future.boxed()),
     });
-    RUNNABLE.with(|runnable| runnable.borrow_mut().push_back(t));
+    run_task(t);
 }
 
 pub struct Async<T: Source> {
