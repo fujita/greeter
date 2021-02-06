@@ -8,6 +8,6 @@ edition = "2018"
 
 [dependencies]
 proto = { path="../proto" }
-glommio = { git = "https://github.com/DataDog/glommio", rev = "05d63c8" }
+glommio = { git = "https://github.com/DataDog/glommio", rev = "160f1f4" }
 async-compat = "0.2"
 num_cpus = "1.0"
