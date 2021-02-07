@@ -7,4 +7,5 @@ members = [
     "greeter-minimum",
     "greeter-smol",
     "greeter-tokio",
+    "greeter-noasync"
 ]

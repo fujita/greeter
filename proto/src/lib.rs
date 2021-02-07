@@ -27,7 +27,7 @@ pub fn create_listen_socket() -> std::net::TcpListener {
     sock.set_reuse_port(true).unwrap();
     sock.set_nonblocking(true).unwrap();
     sock.bind(&addr.into()).unwrap();
-    sock.listen(16384).unwrap();
+    sock.listen(32768).unwrap();
 
     sock.into_tcp_listener()
 }
