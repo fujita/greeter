@@ -1,18 +1,20 @@
 use futures::future::{BoxFuture, FutureExt};
 use futures::prelude::*;
-use mio::{event::Source, net::TcpListener, net::TcpStream, Events, Interest, Token};
-use rustc_hash::FxHashMap;
+use iou::IoUring;
+use nix::poll::PollFlags;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::{env, thread};
+use uring_sys::io_uring_prep_poll_add;
 
 struct Poller {
-    poll: mio::Poll,
-    wait: FxHashMap<Token, Waker>,
+    ring: IoUring,
+    wait: rustc_hash::FxHashMap<u64, Waker>,
 }
 
 const NR_TASKS: usize = 2048;
@@ -20,8 +22,8 @@ const NR_TASKS: usize = 2048;
 thread_local! {
     static POLLER : RefCell<Poller> = {
         RefCell::new(Poller{
-            poll: mio::Poll::new().unwrap(),
-            wait: FxHashMap::default(),
+            ring: IoUring::new(4096).unwrap(),
+            wait: rustc_hash::FxHashMap::default(),
         })
     };
 
@@ -59,20 +61,26 @@ where
             core_affinity::set_for_current(core_affinity::CoreId { id: i });
             spawn(r);
 
-            let mut events = Events::with_capacity(NR_TASKS);
             loop {
-                let mut ready =
-                    RUNNABLE.with(|runnable| runnable.replace(VecDeque::with_capacity(NR_TASKS)));
+                loop {
+                    let mut ready = RUNNABLE
+                        .with(|runnable| runnable.replace(VecDeque::with_capacity(NR_TASKS)));
 
-                for t in ready.drain(..) {
-                    run_task(t);
+                    if ready.is_empty() {
+                        break;
+                    }
+
+                    for t in ready.drain(..) {
+                        run_task(t);
+                    }
                 }
 
                 POLLER.with(|poller| {
                     let mut p = poller.borrow_mut();
-                    p.poll.poll(&mut events, None).unwrap();
-                    for e in events.iter() {
-                        if let Some(w) = p.wait.remove(&e.token()) {
+                    let _ = p.ring.wait_for_cqes(1);
+
+                    while let Some(cqe) = p.ring.peek_for_cqe() {
+                        if let Some(w) = p.wait.remove(&cqe.user_data()) {
                             w.wake();
                         }
                     }
@@ -101,35 +109,15 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
     let t = Rc::new(Task {
         future: RefCell::new(future.boxed()),
     });
-    run_task(t);
+    RUNNABLE.with(|runnable| runnable.borrow_mut().push_back(t));
 }
 
-pub struct Async<T: Source> {
+pub struct Async<T: AsRawFd> {
     io: Box<T>,
 }
 
-impl<T: Source> Drop for Async<T> {
-    fn drop(&mut self) {
-        POLLER.with(|poller| {
-            let poller = poller.borrow_mut();
-            poller.poll.registry().deregister(&mut self.io).unwrap();
-        });
-    }
-}
-
 impl Async<TcpListener> {
-    pub fn new(listener: std::net::TcpListener) -> Self {
-        let mut listener = TcpListener::from_std(listener);
-        let token = Token(listener.as_raw_fd() as usize);
-
-        POLLER.with(|poller| {
-            let poller = poller.borrow_mut();
-            poller
-                .poll
-                .registry()
-                .register(&mut listener, token, Interest::READABLE)
-                .unwrap();
-        });
+    pub fn new(listener: TcpListener) -> Self {
         Async {
             io: Box::new(listener),
         }
@@ -140,12 +128,21 @@ impl Stream for Async<TcpListener> {
     type Item = std::io::Result<Async<TcpStream>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let token = Token(self.as_ref().io.as_raw_fd() as usize);
+        let token = self.as_ref().io.as_raw_fd() as u64;
         match self.io.accept() {
-            Ok(stream) => Poll::Ready(Some(Ok(Async::<TcpStream>::new(stream.0)))),
+            Ok((stream, _)) => Poll::Ready(Some(Ok(Async::<TcpStream>::new(stream)))),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                POLLER.with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
-                std::task::Poll::Pending
+                POLLER.with(|poller| {
+                    let mut poller = poller.borrow_mut();
+                    poller.wait.insert(token, cx.waker().clone());
+                    let mut q = poller.ring.prepare_sqe().unwrap();
+                    unsafe {
+                        io_uring_prep_poll_add(q.raw_mut(), token as i32, PollFlags::POLLIN.bits());
+                        q.set_user_data(token);
+                        let _ = poller.ring.submit_sqes();
+                    }
+                });
+                Poll::Pending
             }
             Err(e) => std::task::Poll::Ready(Some(Err(e))),
         }
@@ -153,7 +150,7 @@ impl Stream for Async<TcpListener> {
 }
 
 impl Async<TcpStream> {
-    pub fn new(mut io: TcpStream) -> Self {
+    pub fn new(io: TcpStream) -> Self {
         io.set_nodelay(true).unwrap();
         let raw_fd = io.as_raw_fd();
         let flags =
@@ -162,15 +159,6 @@ impl Async<TcpStream> {
                 | nix::fcntl::OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(raw_fd, nix::fcntl::F_SETFL(flags)).unwrap();
 
-        POLLER.with(|poller| {
-            let token = Token(raw_fd as usize);
-            let poller = poller.borrow_mut();
-            poller
-                .poll
-                .registry()
-                .register(&mut io, token, Interest::READABLE | Interest::WRITABLE)
-                .unwrap();
-        });
         Async { io: Box::new(io) }
     }
 }
@@ -181,13 +169,19 @@ impl tokio::io::AsyncRead for Async<TcpStream> {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        let token = Token(self.io.as_raw_fd() as usize);
+        let token = self.io.as_raw_fd() as u64;
         unsafe {
             let b = &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
             match self.io.read(b) {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    POLLER
-                        .with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
+                    POLLER.with(|poller| {
+                        let mut poller = poller.borrow_mut();
+                        poller.wait.insert(token, cx.waker().clone());
+                        let mut q = poller.ring.prepare_sqe().unwrap();
+                        io_uring_prep_poll_add(q.raw_mut(), token as i32, PollFlags::POLLIN.bits());
+                        q.set_user_data(token);
+                        let _ = poller.ring.submit_sqes();
+                    });
                     Poll::Pending
                 }
                 Ok(n) => {
@@ -207,10 +201,23 @@ impl tokio::io::AsyncWrite for Async<TcpStream> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        let token = Token(self.io.as_raw_fd() as usize);
+        let token = self.io.as_raw_fd() as u64;
         match self.io.write(buf) {
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                POLLER.with(|poller| poller.borrow_mut().wait.insert(token, cx.waker().clone()));
+                POLLER.with(|poller| {
+                    let mut poller = poller.borrow_mut();
+                    poller.wait.insert(token, cx.waker().clone());
+                    let mut q = poller.ring.prepare_sqe().unwrap();
+                    unsafe {
+                        io_uring_prep_poll_add(
+                            q.raw_mut(),
+                            token as i32,
+                            PollFlags::POLLOUT.bits(),
+                        );
+                        q.set_user_data(token);
+                    }
+                    let _ = poller.ring.submit_sqes();
+                });
                 Poll::Pending
             }
             x => Poll::Ready(x),

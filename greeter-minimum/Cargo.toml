@@ -8,7 +8,6 @@ edition = "2018"
 
 [dependencies]
 proto = { path="../proto" }
-mio = { version="0.7", features = ["os-poll","tcp"] }
 num_cpus = "1.0"
 core_affinity = "0.5"
 nix = "0.18"
@@ -16,3 +15,6 @@ futures = "0.3"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
 rustc-hash = "1"
+libc = "0.2"
+iou = "0.3"
+uring-sys = "0.7"
