@@ -2,10 +2,10 @@
 
 Tested with the following runtimes.
 
-- Tokio
-- async-std
-- smol
 - glommio
+- Tokio
+- smol
+- async-std
 - minimum (simple runtime using io_uring API with poll opcode)
 
 ## Hardware
