@@ -6,7 +6,7 @@ Tested with the following runtimes.
 - Tokio
 - smol
 - async-std
-- minimum (simple runtime using io_uring API with poll opcode)
+- minimum (simple runtime that shares nothing between CPUs and uses io_uring API with IORING_OP_POLL_ADD)
 
 ## Hardware
 
