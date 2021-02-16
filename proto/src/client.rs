@@ -90,21 +90,23 @@ where
         self.wqueue.push_back(buf.into_inner());
     }
 
-    async fn flush(&mut self) {
+    async fn flush(&mut self) -> Result<(), Error> {
         while let Some(buf) = self.wqueue.pop_front() {
             if buf.len() > self.window_size as usize {
                 println!("window size is full!");
                 self.wqueue.push_front(buf);
-                return;
+                return Ok(());
             }
 
             match self.stream.write(&buf).await {
                 Ok(_) => {}
-                Err(_) => {
+                Err(e) => {
                     self.wqueue.push_front(buf);
+                    return Err(Error::Disconnected(e));
                 }
             }
         }
+        Ok(())
     }
 
     fn consume(&mut self, size: usize) -> Option<Vec<u8>> {
@@ -257,7 +259,7 @@ where
                 }
             }
         }
-        self.flush().await;
+        self.flush().await?;
         Ok(())
     }
 
