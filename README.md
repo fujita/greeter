@@ -26,5 +26,3 @@ ghz --insecure --proto helloworld.proto --call helloworld.Greeter.SayHello -d '{
 ## Results
 
 ![Throughput (requests per second)](https://raw.githubusercontent.com/fujita/greeter/images/20210219-01.png)
-
-Note that glommio couldn't complete the benchmark with 24,000 clietns.
