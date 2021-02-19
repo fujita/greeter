@@ -10,7 +10,7 @@ Tested with the following runtimes.
 
 ## Hardware
 
-- Server: c6gn.8xlarge (32 vCPU/64 GiB)
+- Server: c6gn.8xlarge (32 vCPU/64 GiB) / Kernel 5.8.0
 - Client: c5n.9xlarge (36 vCPU/96 GiB)
 
 ## Benchmark
@@ -25,6 +25,6 @@ ghz --insecure --proto helloworld.proto --call helloworld.Greeter.SayHello -d '{
 
 ## Results
 
-![Throughput (requests per second)](https://raw.githubusercontent.com/fujita/greeter/images/20210210-01.png)
+![Throughput (requests per second)](https://raw.githubusercontent.com/fujita/greeter/images/20210219-01.png)
 
 Note that glommio couldn't complete the benchmark with 24,000 clietns.
