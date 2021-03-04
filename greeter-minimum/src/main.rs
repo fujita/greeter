@@ -16,8 +16,8 @@ async fn serve() {
 }
 
 fn main() {
-    let matches = clap_app!(gretter =>
-        (@arg MODE: -m --mode +takes_value "specify mode")
+    let matches = clap_app!(greeter =>
+        (@arg MODE: -m --mode +takes_value "specify I/O strategy, which can be: epoll, async, uringpoll, or hybrid")
     )
     .get_matches();
 
