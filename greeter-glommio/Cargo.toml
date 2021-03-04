@@ -11,3 +11,4 @@ proto = { path="../proto" }
 glommio = { git = "https://github.com/DataDog/glommio", rev = "19ab20f" }
 async-compat = "0.2"
 num_cpus = "1.0"
+futures-util = "0.3"

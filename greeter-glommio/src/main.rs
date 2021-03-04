@@ -1,3 +1,4 @@
+use futures_util::stream::StreamExt;
 use glommio::net::TcpListener;
 use glommio::{LocalExecutorBuilder, Task};
 
@@ -11,10 +12,10 @@ fn main() {
             let ex = LocalExecutorBuilder::new().pin_to_cpu(i).make().unwrap();
             ex.run(async move {
                 let listener = TcpListener::bind("[::]:50051").unwrap();
-                loop {
-                    let stream = listener.accept().await.unwrap();
+                let mut incoming = listener.incoming();
+                while let Some(stream) = incoming.next().await {
                     Task::local(async move {
-                        proto::client::Client::new(async_compat::Compat::new(stream))
+                        proto::client::Client::new(async_compat::Compat::new(stream.unwrap()))
                             .serve()
                             .await;
                     })
