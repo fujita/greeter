@@ -1,29 +1,33 @@
 use futures::future::{BoxFuture, FutureExt};
 use futures::prelude::*;
-use iou::IoUring;
+use iou::{IoUring, SQE};
 use nix::poll::PollFlags;
+use nix::sys::socket::SockFlag;
+use polling::Poller;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
-use std::{env, thread};
 use uring_sys::io_uring_prep_poll_add;
 
-struct Poller {
+struct Parking {
+    kind: Option<Kind>,
     ring: IoUring,
-    wait: rustc_hash::FxHashMap<u64, Waker>,
+    poller: Poller,
+    completion: rustc_hash::FxHashMap<u64, Completion>,
 }
-
 const NR_TASKS: usize = 2048;
 
 thread_local! {
-    static POLLER : RefCell<Poller> = {
-        RefCell::new(Poller{
+    static PARKING : RefCell<Parking> = {
+        RefCell::new(Parking{
+            kind: None,
             ring: IoUring::new(4096).unwrap(),
-            wait: rustc_hash::FxHashMap::default(),
+            poller: Poller::new().unwrap(),
+            completion: rustc_hash::FxHashMap::default(),
         })
     };
 
@@ -33,66 +37,96 @@ thread_local! {
 
 }
 
+impl Parking {
+    fn add<T: AsRawFd>(&mut self, a: &Async<T>) {
+        let raw_fd = a.io.as_raw_fd();
+        match self.kind.as_ref().unwrap() {
+            Kind::Epoll => {
+                a.set_nonblocking(true);
+                self.poller
+                    .add(a.io.as_ref(), polling::Event::none(raw_fd as usize))
+                    .unwrap();
+            }
+            Kind::UringPoll => a.set_nonblocking(true),
+            Kind::Async | Kind::Hybrid => a.set_nonblocking(false),
+        }
+    }
+
+    fn delete<T: AsRawFd>(&mut self, a: &Async<T>) {
+        if let Kind::Epoll = self.kind.as_ref().unwrap() {
+            self.poller.delete(a.io.as_ref()).unwrap();
+        }
+    }
+
+    fn modify<T: AsRawFd>(&mut self, a: &Async<T>, cx: &mut Context, is_readable: bool) {
+        let raw_fd = a.io.as_raw_fd() as u64;
+        let c = Completion::new(cx.waker().clone());
+        self.completion.insert(raw_fd, c);
+
+        match self.kind.as_ref().unwrap() {
+            Kind::Epoll => {
+                let e = if is_readable {
+                    polling::Event::readable(raw_fd as usize)
+                } else {
+                    polling::Event::writable(raw_fd as usize)
+                };
+                self.poller.modify(a.io.as_ref(), e).unwrap();
+            }
+            Kind::UringPoll => {
+                let mut q = self.ring.prepare_sqe().unwrap();
+                unsafe {
+                    let flags = if is_readable {
+                        PollFlags::POLLIN.bits()
+                    } else {
+                        PollFlags::POLLOUT.bits()
+                    };
+                    io_uring_prep_poll_add(q.raw_mut(), raw_fd as i32, flags);
+                    q.set_user_data(raw_fd as u64);
+                    self.ring.submit_sqes().unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn wait(&mut self) {
+        match self.kind.as_ref().unwrap() {
+            Kind::Epoll => {
+                let mut events = Vec::with_capacity(NR_TASKS);
+                let _ = self.poller.wait(&mut events, None);
+                for ev in &events {
+                    if let Some(c) = self.completion.remove(&(ev.key as u64)) {
+                        c.waker.unwrap().wake();
+                    }
+                }
+            }
+            Kind::UringPoll => {
+                let _ = self.ring.wait_for_cqes(1);
+                while let Some(cqe) = self.ring.peek_for_cqe() {
+                    if let Some(c) = self.completion.remove(&cqe.user_data()) {
+                        c.waker.unwrap().wake();
+                    }
+                }
+            }
+            Kind::Async | Kind::Hybrid => {
+                let _ = self.ring.wait_for_cqes(1);
+                while let Some(cqe) = self.ring.peek_for_cqe() {
+                    let result = cqe.result();
+                    let user_data = cqe.user_data();
+                    self.completion.entry(user_data).and_modify(|e| {
+                        e.complete(result.map(|x| x as usize));
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn run_task(t: Rc<Task>) {
     let future = t.future.borrow_mut();
     let w = waker(t.clone());
     let mut context = Context::from_waker(&w);
     let _ = Pin::new(future).as_mut().poll(&mut context);
-}
-
-pub fn run<F, T>(f: F)
-where
-    F: Fn() -> T,
-    T: Future<Output = ()> + Send + 'static,
-{
-    let cpus = {
-        env::var("RUSTMAXPROCS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(num_cpus::get)
-    };
-
-    println!("Hello, greeter-minimum ({} cpus)!", cpus);
-
-    let mut handles = Vec::new();
-    for i in 0..cpus {
-        let r = f();
-        let h = thread::spawn(move || {
-            core_affinity::set_for_current(core_affinity::CoreId { id: i });
-            spawn(r);
-
-            loop {
-                loop {
-                    let mut ready = RUNNABLE
-                        .with(|runnable| runnable.replace(VecDeque::with_capacity(NR_TASKS)));
-
-                    if ready.is_empty() {
-                        break;
-                    }
-
-                    for t in ready.drain(..) {
-                        run_task(t);
-                    }
-                }
-
-                POLLER.with(|poller| {
-                    let mut p = poller.borrow_mut();
-                    let _ = p.ring.wait_for_cqes(1);
-
-                    while let Some(cqe) = p.ring.peek_for_cqe() {
-                        if let Some(w) = p.wait.remove(&cqe.user_data()) {
-                            w.wake();
-                        }
-                    }
-                });
-            }
-        });
-        handles.push(h);
-    }
-
-    for h in handles {
-        let _ = h.join();
-    }
 }
 
 struct Task {
@@ -114,33 +148,98 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
 
 pub struct Async<T: AsRawFd> {
     io: Box<T>,
+    flags: iou::sqe::OFlag,
 }
 
-impl Async<TcpListener> {
-    pub fn new(listener: TcpListener) -> Self {
-        Async {
-            io: Box::new(listener),
-        }
+impl<T: AsRawFd> Async<T> {
+    pub fn new(io: T) -> Self {
+        let raw_fd = io.as_raw_fd();
+        let a = Async {
+            io: Box::new(io),
+            flags: nix::fcntl::OFlag::from_bits(
+                nix::fcntl::fcntl(raw_fd, nix::fcntl::F_GETFL).unwrap(),
+            )
+            .unwrap(),
+        };
+        PARKING.with(|parker| {
+            parker.borrow_mut().add(&a);
+        });
+        a
+    }
+
+    fn set_nonblocking(&self, enable: bool) {
+        let raw_fd = self.io.as_raw_fd();
+        let flags = if enable {
+            self.flags | nix::fcntl::OFlag::O_NONBLOCK
+        } else {
+            self.flags & !nix::fcntl::OFlag::O_NONBLOCK
+        };
+        nix::fcntl::fcntl(raw_fd, nix::fcntl::F_SETFL(flags)).unwrap();
+    }
+
+    fn has_completion(&self) -> bool {
+        let raw_fd = self.io.as_raw_fd() as u64;
+        PARKING.with(|parking| {
+            let parking = parking.borrow_mut();
+            parking.completion.contains_key(&raw_fd)
+        })
+    }
+
+    fn poll_submit<'a>(&'a mut self, cx: &mut Context<'_>, f: impl FnOnce(&mut SQE<'_>)) {
+        let c = Completion::new(cx.waker().clone());
+        let raw_fd = self.io.as_raw_fd() as u64;
+        PARKING.with(|parking| {
+            let mut parking = parking.borrow_mut();
+            let mut q = parking.ring.prepare_sqe().unwrap();
+            f(&mut q);
+            unsafe {
+                q.set_user_data(raw_fd as u64);
+            }
+            parking.completion.insert(raw_fd, c);
+            parking.ring.submit_sqes().unwrap();
+        });
+    }
+
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Option<std::io::Result<usize>> {
+        let raw_fd = self.io.as_raw_fd() as u64;
+        let is_completed = PARKING.with(|parking| {
+            let mut parking = parking.borrow_mut();
+            let c = parking.completion.get_mut(&raw_fd).unwrap();
+            if c.result.is_none() {
+                c.waker.replace(cx.waker().clone());
+                None
+            } else {
+                Some(c.result.take().unwrap())
+            }
+        });
+        is_completed.map(|r| {
+            PARKING.with(|parking| {
+                parking.borrow_mut().completion.remove(&raw_fd);
+            });
+            r
+        })
     }
 }
 
-impl Stream for Async<TcpListener> {
-    type Item = std::io::Result<Async<TcpStream>>;
+impl<T: AsRawFd> Drop for Async<T> {
+    fn drop(&mut self) {
+        PARKING.with(|parking| {
+            parking.borrow_mut().delete(self);
+        });
+    }
+}
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let token = self.as_ref().io.as_raw_fd() as u64;
-        match self.io.accept() {
+impl Async<TcpListener> {
+    fn poll_sync(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Option<std::io::Result<Async<TcpStream>>>> {
+        match self.as_ref().io.accept() {
             Ok((stream, _)) => Poll::Ready(Some(Ok(Async::<TcpStream>::new(stream)))),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                POLLER.with(|poller| {
-                    let mut poller = poller.borrow_mut();
-                    poller.wait.insert(token, cx.waker().clone());
-                    let mut q = poller.ring.prepare_sqe().unwrap();
-                    unsafe {
-                        io_uring_prep_poll_add(q.raw_mut(), token as i32, PollFlags::POLLIN.bits());
-                        q.set_user_data(token);
-                        let _ = poller.ring.submit_sqes();
-                    }
+                PARKING.with(|parking| {
+                    let mut parking = parking.borrow_mut();
+                    parking.modify(&self, cx, true);
                 });
                 Poll::Pending
             }
@@ -149,17 +248,43 @@ impl Stream for Async<TcpListener> {
     }
 }
 
-impl Async<TcpStream> {
-    pub fn new(io: TcpStream) -> Self {
-        io.set_nodelay(true).unwrap();
-        let raw_fd = io.as_raw_fd();
-        let flags =
-            nix::fcntl::OFlag::from_bits(nix::fcntl::fcntl(raw_fd, nix::fcntl::F_GETFL).unwrap())
-                .unwrap()
-                | nix::fcntl::OFlag::O_NONBLOCK;
-        nix::fcntl::fcntl(raw_fd, nix::fcntl::F_SETFL(flags)).unwrap();
+impl Stream for Async<TcpListener> {
+    type Item = std::io::Result<Async<TcpStream>>;
 
-        Async { io: Box::new(io) }
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let kind = PARKING.with(|parking| parking.borrow().kind.unwrap());
+        let raw_fd = self.io.as_raw_fd();
+        match kind {
+            Kind::Epoll | Kind::UringPoll => self.poll_sync(cx),
+            Kind::Async | Kind::Hybrid => {
+                if !self.has_completion() {
+                    if kind == Kind::Hybrid {
+                        self.set_nonblocking(true);
+                        let res = self.as_ref().io.accept();
+                        self.set_nonblocking(false);
+                        if let Ok((stream, _)) = res {
+                            return Poll::Ready(Some(Ok(Async::<TcpStream>::new(stream))));
+                        }
+                    }
+
+                    self.poll_submit(cx, |q| unsafe {
+                        q.prep_accept(raw_fd, None, SockFlag::empty());
+                    });
+                    return std::task::Poll::Pending;
+                }
+
+                match self.poll_finish(cx) {
+                    Some(x) => match x {
+                        Ok(x) => {
+                            let stream = unsafe { TcpStream::from_raw_fd(x as i32) };
+                            std::task::Poll::Ready(Some(Ok(Async::<TcpStream>::new(stream))))
+                        }
+                        Err(e) => std::task::Poll::Ready(Some(Err(e))),
+                    },
+                    None => std::task::Poll::Pending,
+                }
+            }
+        }
     }
 }
 
@@ -169,28 +294,74 @@ impl tokio::io::AsyncRead for Async<TcpStream> {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        let token = self.io.as_raw_fd() as u64;
-        unsafe {
-            let b = &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
-            match self.io.read(b) {
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    POLLER.with(|poller| {
-                        let mut poller = poller.borrow_mut();
-                        poller.wait.insert(token, cx.waker().clone());
-                        let mut q = poller.ring.prepare_sqe().unwrap();
-                        io_uring_prep_poll_add(q.raw_mut(), token as i32, PollFlags::POLLIN.bits());
-                        q.set_user_data(token);
-                        let _ = poller.ring.submit_sqes();
+        let raw_fd = self.io.as_raw_fd() as u64;
+        let kind = PARKING.with(|parking| parking.borrow().kind.unwrap());
+
+        match kind {
+            Kind::Epoll | Kind::UringPoll => unsafe {
+                let b =
+                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
+                match self.io.read(b) {
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        PARKING.with(|parking| {
+                            let mut parking = parking.borrow_mut();
+                            parking.modify(&self, cx, true);
+                        });
+                        Poll::Pending
+                    }
+                    Ok(n) => {
+                        buf.assume_init(n);
+                        buf.advance(n);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            },
+            Kind::Async | Kind::Hybrid => unsafe {
+                let len = buf.remaining();
+                let b =
+                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
+                let addr = b.as_mut_ptr();
+
+                if !self.has_completion() {
+                    if kind == Kind::Hybrid {
+                        let res = libc::recv(
+                            raw_fd as i32,
+                            addr as _,
+                            len,
+                            nix::sys::socket::MsgFlags::MSG_DONTWAIT.bits(),
+                        );
+                        if res >= 0 {
+                            let n = res as usize;
+                            buf.assume_init(n);
+                            buf.advance(n);
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+
+                    self.poll_submit(cx, |q| {
+                        uring_sys::io_uring_prep_recv(
+                            q.raw_mut(),
+                            raw_fd as i32,
+                            addr as _,
+                            len as _,
+                            0,
+                        );
                     });
-                    Poll::Pending
+                    return std::task::Poll::Pending;
                 }
-                Ok(n) => {
-                    buf.assume_init(n);
-                    buf.advance(n);
-                    Poll::Ready(Ok(()))
+                match self.poll_finish(cx) {
+                    Some(x) => match x {
+                        Ok(n) => {
+                            buf.assume_init(n);
+                            buf.advance(n);
+                            Poll::Ready(Ok(()))
+                        }
+                        Err(e) => Poll::Ready(Err(e)),
+                    },
+                    None => std::task::Poll::Pending,
                 }
-                Err(e) => Poll::Ready(Err(e)),
-            }
+            },
         }
     }
 }
@@ -201,26 +372,53 @@ impl tokio::io::AsyncWrite for Async<TcpStream> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        let token = self.io.as_raw_fd() as u64;
-        match self.io.write(buf) {
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                POLLER.with(|poller| {
-                    let mut poller = poller.borrow_mut();
-                    poller.wait.insert(token, cx.waker().clone());
-                    let mut q = poller.ring.prepare_sqe().unwrap();
-                    unsafe {
-                        io_uring_prep_poll_add(
-                            q.raw_mut(),
-                            token as i32,
-                            PollFlags::POLLOUT.bits(),
-                        );
-                        q.set_user_data(token);
+        let raw_fd = self.io.as_raw_fd() as u64;
+        let kind = PARKING.with(|parking| parking.borrow().kind.unwrap());
+        match kind {
+            Kind::Epoll | Kind::UringPoll => match self.io.write(buf) {
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    PARKING.with(|parking| {
+                        let mut parking = parking.borrow_mut();
+                        parking.modify(&self, cx, false);
+                    });
+                    Poll::Pending
+                }
+                x => Poll::Ready(x),
+            },
+            Kind::Async | Kind::Hybrid => {
+                if !self.has_completion() {
+                    if kind == Kind::Hybrid {
+                        unsafe {
+                            let res = libc::send(
+                                raw_fd as i32,
+                                buf.as_ptr() as _,
+                                buf.len() as _,
+                                nix::sys::socket::MsgFlags::MSG_DONTWAIT.bits(),
+                            );
+                            if res >= 0 {
+                                return Poll::Ready(Ok(res as usize));
+                            }
+                        }
                     }
-                    let _ = poller.ring.submit_sqes();
-                });
-                Poll::Pending
+                    self.poll_submit(cx, |q| unsafe {
+                        uring_sys::io_uring_prep_send(
+                            q.raw_mut(),
+                            raw_fd as i32,
+                            buf.as_ptr() as _,
+                            buf.len() as _,
+                            0,
+                        );
+                    });
+                    return std::task::Poll::Pending;
+                }
+                match self.poll_finish(cx) {
+                    Some(x) => match x {
+                        Ok(n) => Poll::Ready(Ok(n)),
+                        Err(e) => Poll::Ready(Err(e)),
+                    },
+                    None => std::task::Poll::Pending,
+                }
             }
-            x => Poll::Ready(x),
         }
     }
 
@@ -298,5 +496,91 @@ impl<T: RcWake> Helper<T> {
 
     unsafe fn drop_waker(ptr: *const ()) {
         drop(Rc::from_raw(ptr as *const Task));
+    }
+}
+
+#[derive(Debug)]
+pub struct Completion {
+    waker: Option<Waker>,
+    result: Option<std::io::Result<usize>>,
+}
+
+impl Completion {
+    fn new(waker: Waker) -> Completion {
+        Completion {
+            waker: Some(waker),
+            result: None,
+        }
+    }
+
+    fn complete(&mut self, result: std::io::Result<usize>) {
+        self.result = Some(result);
+        let w = self.waker.take().unwrap();
+        w.wake();
+    }
+}
+
+#[derive(PartialEq, Debug, Clone, Copy)]
+pub enum Kind {
+    Epoll,     // socket API with epoll; non-blocking synchronous socket API
+    UringPoll, // socket API with io_uring (POLL); replace epoll with io_uring (POLL)
+    Async,     // io_uring(ACCEPT/RECV/SEND); always doing asynchronous I/Os.
+    Hybrid, // try non-blocking synchronous socket API first, it fails, io_uring(ACCEPT/RECV/SEND)
+}
+
+pub struct Runtime {
+    kind: Kind,
+}
+
+impl Runtime {
+    pub fn new(kind: Kind) -> Runtime {
+        Runtime { kind }
+    }
+
+    pub fn pin_to_cpu(self, id: usize) -> Self {
+        core_affinity::set_for_current(core_affinity::CoreId { id });
+        self
+    }
+
+    pub fn run<F, T>(&self, f: F)
+    where
+        F: Fn() -> T,
+        T: Future<Output = ()> + Send + 'static,
+    {
+        PARKING.with(|parking| {
+            parking.borrow_mut().kind = Some(self.kind);
+        });
+
+        let waker = waker_fn::waker_fn(|| {});
+        let cx = &mut Context::from_waker(&waker);
+
+        let fut = f();
+        pin_utils::pin_mut!(fut);
+
+        loop {
+            if let Poll::Ready(_) = fut.as_mut().poll(cx) {
+                break;
+            }
+
+            loop {
+                let mut ready =
+                    RUNNABLE.with(|runnable| runnable.replace(VecDeque::with_capacity(NR_TASKS)));
+
+                if ready.is_empty() {
+                    break;
+                }
+
+                for t in ready.drain(..) {
+                    run_task(t);
+                }
+            }
+
+            if let Poll::Ready(_) = fut.as_mut().poll(cx) {
+                break;
+            }
+            PARKING.with(|parking| {
+                parking.borrow_mut().wait();
+            });
+        }
     }
 }
