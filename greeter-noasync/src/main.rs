@@ -87,7 +87,6 @@ impl Drop for Client {
 
 impl Client {
     fn new(mut stream: TcpStream) -> Self {
-        stream.set_nodelay(true).unwrap();
         let raw_fd = stream.as_raw_fd();
         let token = Token(raw_fd as usize);
 
