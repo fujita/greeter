@@ -28,7 +28,7 @@ fn main() {
             "uringpoll" => runtime::Kind::UringPoll,
             "hybrid" => runtime::Kind::Hybrid,
             _ => {
-                println!("use 'classic', 'async', 'uringpoll', or 'hybrid'");
+                println!("use 'epoll', 'async', 'uringpoll', or 'hybrid'");
                 std::process::exit(1);
             }
         }

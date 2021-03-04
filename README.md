@@ -4,13 +4,13 @@ This repository is for playing Rust async runtimes to investigate how io-uring c
 
 ## async runtime supporting multiple I/O interfaces
 
-How should server software handle lots of clients simultaneously? Implemented simple async runtime supporting the following four I/O strategies.
+How should server software handle lots of clients simultaneously? Implemented [simple async runtime](https://github.com/fujita/greeter/tree/master/greeter-minimum) supporting the following four I/O strategies.
 
 <dl>
   <dt>epoll</dt>
   <dd>epoll + non-blocking socket API</dd>
   <dt>uring-poll</dt>
-  <dd>simply replace epoll with io-uring; io-uring (IORING_OP_POLL_{ADD|DEL}) + non-blocking socket API</dd>
+  <dd>simply replace epoll with io-uring; io-uring (IORING_OP_POLL_ADD) + non-blocking socket API</dd>
   <dt>async</dt>
   <dd>purely io-uring (IORING_OP_{ACCEPT|RECV|SEND})</dd>
   <dt>hybrid</dt>
