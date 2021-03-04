@@ -116,7 +116,7 @@ where
         Some(self.buffer.split_to(size).to_vec())
     }
 
-    fn handle_dataframe(&mut self, frame: DataFrame) -> Result<(), Error> {
+    fn handle_dataframe(&mut self, frame: DataFrame) {
         let mut buf = Cursor::new(Vec::new());
 
         let req = helloworld::HelloRequest::from_reader(
@@ -156,7 +156,6 @@ where
         frame.serialize_into(&mut buf).unwrap();
 
         self.wqueue.push_back(buf.into_inner());
-        Ok(())
     }
 
     #[allow(clippy::transmute_ptr_to_ref)]
@@ -221,7 +220,7 @@ where
                         match HttpFrame::from_raw(&raw) {
                             Ok(frame) => match frame {
                                 HttpFrame::DataFrame(frame) => {
-                                    self.handle_dataframe(frame)?;
+                                    self.handle_dataframe(frame);
                                 }
                                 HttpFrame::HeadersFrame(frame) => {
                                     for (k, v) in

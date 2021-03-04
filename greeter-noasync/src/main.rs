@@ -190,7 +190,7 @@ impl Client {
         Ok(())
     }
 
-    fn handle_dataframe(&mut self, frame: DataFrame) -> Result<(), Error> {
+    fn handle_dataframe(&mut self, frame: DataFrame) {
         let mut buf = Cursor::new(Vec::new());
 
         let req = proto::helloworld::HelloRequest::from_reader(
@@ -230,7 +230,6 @@ impl Client {
         frame.serialize_into(&mut buf).unwrap();
 
         self.wqueue.push_back(buf.into_inner());
-        Ok(())
     }
 
     #[allow(clippy::transmute_ptr_to_ref)]
@@ -271,7 +270,7 @@ impl Client {
                             match HttpFrame::from_raw(&raw) {
                                 Ok(frame) => match frame {
                                     HttpFrame::DataFrame(frame) => {
-                                        self.handle_dataframe(frame)?;
+                                        self.handle_dataframe(frame);
                                     }
                                     HttpFrame::HeadersFrame(frame) => {
                                         for (k, v) in

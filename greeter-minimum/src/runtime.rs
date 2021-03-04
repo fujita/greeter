@@ -558,7 +558,7 @@ impl Runtime {
         pin_utils::pin_mut!(fut);
 
         loop {
-            if let Poll::Ready(_) = fut.as_mut().poll(cx) {
+            if fut.as_mut().poll(cx).is_ready() {
                 break;
             }
 
@@ -575,7 +575,7 @@ impl Runtime {
                 }
             }
 
-            if let Poll::Ready(_) = fut.as_mut().poll(cx) {
+            if fut.as_mut().poll(cx).is_ready() {
                 break;
             }
             PARKING.with(|parking| {
