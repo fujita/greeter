@@ -32,7 +32,7 @@ ghz --insecure --proto helloworld.proto --call helloworld.Greeter.SayHello -d '{
 - One client machine issues 3,000,000 requests in total.
 - Tested four client machines.
 
-![Throughput (requests per second)](https://raw.githubusercontent.com/fujita/greeter/images/20210304-01.png)
+![Throughput (requests per second)](https://raw.githubusercontent.com/fujita/greeter/images/20210307-01.png)
 
 
 ## gRPC greeter server supporting multiple async runtimes
